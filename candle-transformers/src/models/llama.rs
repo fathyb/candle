@@ -269,7 +269,7 @@ impl CausalSelfAttention {
         candle_nn::rotary_emb::rope(x, &cos, &sin)
     }
 
-    fn forward(
+    pub fn forward(
         &self,
         x: &Tensor,
         index_pos: usize,
@@ -532,5 +532,41 @@ impl Llama {
             ln_f,
             lm_head,
         })
+    }
+
+    /// Forward to the normalized hidden states, before lm_head projection.
+    pub fn forward_hidden(
+        &self,
+        x: &Tensor, // [B, T]
+        index_pos: usize,
+        cache: &mut Cache,
+    ) -> Result<Tensor> {
+        // 1) embeddings
+        let (_b_sz, _t) = x.dims2()?;
+        let mut h = self.wte.forward(x)?; // [B,T,d]
+
+        // 2) blocks
+        for (block_idx, block) in self.blocks.iter().enumerate() {
+            // NOTE: signature is (x, index_pos, block_idx, cache)
+            h = block.forward(&h, index_pos, block_idx, cache)?;
+        }
+
+        // 3) final norm (before lm_head)
+        let h = self.ln_f.forward(&h)?; // [B,T,d]
+        Ok(h)
+    }
+
+    pub fn last_block_q_proj(&self) -> &Linear {
+        &self.blocks.last().unwrap().attn.q_proj
+    }
+    pub fn last_block_k_proj(&self) -> &Linear {
+        &self.blocks.last().unwrap().attn.k_proj
+    }
+    pub fn last_block_o_proj(&self) -> &Linear {
+        &self.blocks.last().unwrap().attn.o_proj
+    }
+
+    pub fn lm_head(&self) -> &Linear {
+        &self.lm_head
     }
 }
