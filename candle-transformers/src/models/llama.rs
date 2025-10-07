@@ -451,6 +451,42 @@ impl Block {
         Ok(x)
     }
 
+    // IA3-hooked forward: optionally scale attn/MLP outputs by per-channel gates.
+    fn forward_with_gates(
+        &self,
+        x: &Tensor,
+        index_pos: usize,
+        block_idx: usize,
+        cache: &mut Cache,
+        gate_attn: Option<&Tensor>, // [d] or [1,1,d]
+        gate_mlp: Option<&Tensor>,  // [d] or [1,1,d]
+    ) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let residual = x;
+        let x_norm = self.rms_1.forward(x)?;
+        let mut attn_out = self.attn.forward(&x_norm, index_pos, block_idx, cache)?; // [B,T,d]
+        if let Some(g) = gate_attn {
+            let gsh = match g.dims() {
+                [d] => g.reshape((1, 1, d))?,
+                _ => g.clone(),
+            };
+            attn_out = (&attn_out * &gsh)?;
+        }
+        let x = (attn_out + residual)?;
+        let residual = &x;
+        let x_norm2 = self.rms_2.forward(&x)?;
+        let mut mlp_out = self.mlp.forward(&x_norm2)?; // [B,T,d]
+        if let Some(g) = gate_mlp {
+            let gsh = match g.dims() {
+                [d] => g.reshape((1, 1, d))?,
+                _ => g.clone(),
+            };
+            mlp_out = (&mlp_out * &gsh)?;
+        }
+        let x = (mlp_out + residual)?;
+        Ok(x)
+    }
+
     fn load(vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let span = tracing::span!(tracing::Level::TRACE, "block");
         let attn = CausalSelfAttention::load(vb.pp("self_attn"), cfg)?;
@@ -553,6 +589,37 @@ impl Llama {
 
         // 3) final norm (before lm_head)
         let h = self.ln_f.forward(&h)?; // [B,T,d]
+        Ok(h)
+    }
+
+    /// Forward to normalized hidden with IA3-style per-block gates on the last-L layers.
+    /// The `gate_attn`/`gate_mlp` slices should each have length L (or be None to disable),
+    /// with per-channel tensors of shape [d] (or broadcastable to [1,1,d]).
+    pub fn forward_hidden_ia3(
+        &self,
+        x: &Tensor, // [B, T]
+        index_pos: usize,
+        cache: &mut Cache,
+        gate_attn: Option<&[Tensor]>,
+        gate_mlp: Option<&[Tensor]>,
+    ) -> Result<Tensor> {
+        let (_b_sz, _t) = x.dims2()?;
+        let mut h = self.wte.forward(x)?; // [B,T,d]
+        let n = self.blocks.len();
+        let l_attn = gate_attn.map(|g| g.len()).unwrap_or(0);
+        let l_mlp = gate_mlp.map(|g| g.len()).unwrap_or(0);
+        for (block_idx, block) in self.blocks.iter().enumerate() {
+            let gate_idx_attn = if l_attn > 0 && block_idx + l_attn >= n {
+                Some(block_idx + l_attn - n)
+            } else { None };
+            let gate_idx_mlp = if l_mlp > 0 && block_idx + l_mlp >= n {
+                Some(block_idx + l_mlp - n)
+            } else { None };
+            let g_attn_t = gate_attn.and_then(|ga| gate_idx_attn.map(|i| &ga[i]));
+            let g_mlp_t = gate_mlp.and_then(|gm| gate_idx_mlp.map(|i| &gm[i]));
+            h = block.forward_with_gates(&h, index_pos, block_idx, cache, g_attn_t, g_mlp_t)?;
+        }
+        let h = self.ln_f.forward(&h)?;
         Ok(h)
     }
 
