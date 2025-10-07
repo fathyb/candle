@@ -451,7 +451,7 @@ impl Block {
         Ok(x)
     }
 
-    // IA3-hooked forward: optionally scale attn/MLP outputs by per-channel gates.
+    // IA3/LoRA-hooked forward: optionally add LoRA residuals and/or scale attn/MLP outputs by per-channel gates.
     fn forward_with_gates(
         &self,
         x: &Tensor,
@@ -460,11 +460,25 @@ impl Block {
         cache: &mut Cache,
         gate_attn: Option<&Tensor>, // [d] or [1,1,d]
         gate_mlp: Option<&Tensor>,  // [d] or [1,1,d]
+        lora_attn: Option<(&Tensor, &Tensor)>, // (A[d,r], B[r,d])
+        lora_mlp: Option<(&Tensor, &Tensor)>,  // (A[d,r], B[r,d])
+        lora_scale: f64,
     ) -> Result<Tensor> {
         let _enter = self.span.enter();
         let residual = x;
         let x_norm = self.rms_1.forward(x)?;
         let mut attn_out = self.attn.forward(&x_norm, index_pos, block_idx, cache)?; // [B,T,d]
+        if let Some((a, b)) = lora_attn {
+            let (b_sz, t_len, d) = attn_out.dims3()?;
+            let r = a.dims2()?.1;
+            let attn2 = attn_out.reshape((b_sz * t_len, d))?; // [B*T, d]
+            let ya2 = attn2.matmul(a)?; // [B*T, r]
+            let ya = ya2.reshape((b_sz, t_len, r))?; // [B,T,r]
+            let ya2b = ya.reshape((b_sz * t_len, r))?;
+            let yab2 = ya2b.matmul(b)?; // [B*T, d]
+            let yab = yab2.reshape((b_sz, t_len, d))?;
+            attn_out = (attn_out + yab.affine(lora_scale, 0.0)?)?;
+        }
         if let Some(g) = gate_attn {
             let gsh = match g.dims() {
                 [d] => g.reshape((1, 1, *d))?,
@@ -476,6 +490,17 @@ impl Block {
         let residual = &x;
         let x_norm2 = self.rms_2.forward(&x)?;
         let mut mlp_out = self.mlp.forward(&x_norm2)?; // [B,T,d]
+        if let Some((a, b)) = lora_mlp {
+            let (b_sz, t_len, d) = mlp_out.dims3()?;
+            let r = a.dims2()?.1;
+            let mlp2 = mlp_out.reshape((b_sz * t_len, d))?;
+            let ya2 = mlp2.matmul(a)?; // [B*T, r]
+            let ya = ya2.reshape((b_sz, t_len, r))?; // [B,T,r]
+            let ya2b = ya.reshape((b_sz * t_len, r))?;
+            let yab2 = ya2b.matmul(b)?; // [B*T, d]
+            let yab = yab2.reshape((b_sz, t_len, d))?;
+            mlp_out = (mlp_out + yab.affine(lora_scale, 0.0)?)?;
+        }
         if let Some(g) = gate_mlp {
             let gsh = match g.dims() {
                 [d] => g.reshape((1, 1, *d))?,
@@ -617,7 +642,38 @@ impl Llama {
             } else { None };
             let g_attn_t = gate_attn.and_then(|ga| gate_idx_attn.map(|i| &ga[i]));
             let g_mlp_t = gate_mlp.and_then(|gm| gate_idx_mlp.map(|i| &gm[i]));
-            h = block.forward_with_gates(&h, index_pos, block_idx, cache, g_attn_t, g_mlp_t)?;
+            h = block.forward_with_gates(&h, index_pos, block_idx, cache, g_attn_t, g_mlp_t, None, None, 0.0)?;
+        }
+        let h = self.ln_f.forward(&h)?;
+        Ok(h)
+    }
+
+    /// Forward with IA3 gates and/or LoRA residuals on the last-L layers.
+    /// lora_attn/lora_mlp slices should each have length L (or be None), pairs of (A[d,r], B[r,d]).
+    pub fn forward_hidden_ia3_lora(
+        &self,
+        x: &Tensor,
+        index_pos: usize,
+        cache: &mut Cache,
+        gate_attn: Option<&[Tensor]>,
+        gate_mlp: Option<&[Tensor]>,
+        lora_attn: Option<&[(Tensor, Tensor)]>,
+        lora_mlp: Option<&[(Tensor, Tensor)]>,
+        lora_scale: f64,
+    ) -> Result<Tensor> {
+        let (_b_sz, _t) = x.dims2()?;
+        let mut h = self.wte.forward(x)?; // [B,T,d]
+        let n = self.blocks.len();
+        let l_attn = gate_attn.map(|g| g.len()).unwrap_or(0).max(lora_attn.map(|g| g.len()).unwrap_or(0));
+        let l_mlp = gate_mlp.map(|g| g.len()).unwrap_or(0).max(lora_mlp.map(|g| g.len()).unwrap_or(0));
+        for (block_idx, block) in self.blocks.iter().enumerate() {
+            let idx_attn = if l_attn > 0 && block_idx + l_attn >= n { Some(block_idx + l_attn - n) } else { None };
+            let idx_mlp  = if l_mlp  > 0 && block_idx + l_mlp  >= n { Some(block_idx + l_mlp  - n) } else { None };
+            let g_attn_t = gate_attn.and_then(|ga| idx_attn.map(|i| &ga[i]));
+            let g_mlp_t  = gate_mlp.and_then(|gm| idx_mlp.map(|i| &gm[i]));
+            let la_t = lora_attn.and_then(|la| idx_attn.map(|i| (&la[i].0, &la[i].1)));
+            let lm_t = lora_mlp.and_then(|lm| idx_mlp.map(|i| (&lm[i].0, &lm[i].1)));
+            h = block.forward_with_gates(&h, index_pos, block_idx, cache, g_attn_t, g_mlp_t, la_t, lm_t, lora_scale)?;
         }
         let h = self.ln_f.forward(&h)?;
         Ok(h)
