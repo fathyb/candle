@@ -467,7 +467,7 @@ impl Block {
         let mut attn_out = self.attn.forward(&x_norm, index_pos, block_idx, cache)?; // [B,T,d]
         if let Some(g) = gate_attn {
             let gsh = match g.dims() {
-                [d] => g.reshape((1, 1, d))?,
+                [d] => g.reshape((1, 1, *d))?,
                 _ => g.clone(),
             };
             attn_out = (&attn_out * &gsh)?;
@@ -478,7 +478,7 @@ impl Block {
         let mut mlp_out = self.mlp.forward(&x_norm2)?; // [B,T,d]
         if let Some(g) = gate_mlp {
             let gsh = match g.dims() {
-                [d] => g.reshape((1, 1, d))?,
+                [d] => g.reshape((1, 1, *d))?,
                 _ => g.clone(),
             };
             mlp_out = (&mlp_out * &gsh)?;
